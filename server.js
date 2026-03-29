@@ -894,3 +894,54 @@ app.delete('/seasons/:seasonId', requireAuth, async (req, res) => {
   if (error) return res.status(500).json({ error: error.message })
   res.json({ ok: true })
 })
+
+// ============================================================
+//  VALEUR MARCHANDE — Estimée par IA
+// ============================================================
+app.post('/players/:id/market-value', requireAuth, async (req, res) => {
+  const { data: player } = await db.from('players').select('*').eq('id', req.params.id).single()
+  if (!player) return res.status(404).json({ error: 'Joueur introuvable' })
+
+  const statsLines = [
+    player.pts     != null && `PTS: ${player.pts}`,
+    player.ast     != null && `AST: ${player.ast}`,
+    player.reb     != null && `REB: ${player.reb}`,
+    player.ts_pct  != null && `TS%: ${player.ts_pct}`,
+    player.usg_pct != null && `USG%: ${player.usg_pct}`,
+    player.bpm     != null && `BPM: ${player.bpm}`,
+    player.net_rtg != null && `Net: ${player.net_rtg}`,
+  ].filter(Boolean).join(' | ')
+
+  try {
+    const result = await callClaude([{
+      role: 'user',
+      content: `You are a basketball contract expert with deep knowledge of European and NBA market values.
+
+Player: ${player.first_name} ${player.last_name}
+Position: ${player.position} | Age: ${player.age} | League: ${player.league} | Team: ${player.team}
+Stats: ${statsLines}
+Scout grade: ${player.scout_grade}/10
+Ceiling: ${player.ceiling || 'Unknown'}
+
+Estimate the realistic annual market value for this player based on:
+1. Current performance and efficiency
+2. Age and development trajectory  
+3. League level (adjust for competition level)
+4. Position scarcity and market demand
+5. Recent comparable transfers in Europe
+
+Return ONLY a JSON object:
+{
+  "market_value": "X€ — Y€ / an",
+  "reasoning": "2 sentences max explaining the estimate",
+  "comparable_contracts": "1-2 similar player contracts as reference"
+}`
+    }], { webSearch: true, maxTokens: 400 })
+
+    const json = JSON.parse(result.replace(/```json|```/g, '').trim())
+    await db.from('players').update({ market_value: json.market_value }).eq('id', req.params.id)
+    res.json(json)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
