@@ -661,3 +661,236 @@ app.listen(PORT, () => {
   console.log(`🏀 ProspectIQ API v1.0 — port ${PORT}`);
   console.log(`   Sync nocturne : 6h00 Europe/Paris`);
 });
+
+
+// ============================================================
+//  BARTTORVIK — Stats NCAA avancées
+// ============================================================
+app.post('/players/:id/sync-barttorvik', requireAuth, async (req, res) => {
+  const { id } = req.params
+  const { data: player } = await db.from('players').select('first_name, last_name, team, barttorvik_url').eq('id', id).single()
+  if (!player) return res.status(404).json({ error: 'Joueur introuvable' })
+
+  // Extraire params depuis l'URL ou utiliser nom/équipe
+  let year = new Date().getFullYear()
+  let playerName = `${player.first_name} ${player.last_name}`
+  let teamName = player.team || ''
+
+  if (player.barttorvik_url) {
+    const url = new URL(player.barttorvik_url)
+    year      = url.searchParams.get('year') || year
+    playerName = url.searchParams.get('p')   || playerName
+    teamName   = url.searchParams.get('t')   || teamName
+  }
+
+  try {
+    const apiUrl = `https://barttorvik.com/getplayer.php?year=${year}&player=${encodeURIComponent(playerName)}&team=${encodeURIComponent(teamName)}`
+    const resp = await fetch(apiUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    })
+
+    if (!resp.ok) throw new Error(`Barttorvik HTTP ${resp.status}`)
+    const data = await resp.json()
+
+    if (!data || !data.length) {
+      // Fallback scraping HTML
+      const htmlUrl = `https://barttorvik.com/playerstat.php?year=${year}&p=${encodeURIComponent(playerName)}&t=${encodeURIComponent(teamName)}`
+      const htmlResp = await fetch(htmlUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      })
+      const html = await htmlResp.text()
+
+      const getVal = (label) => {
+        const regex = new RegExp(`${label}[^\\d-]*([\\d.-]+)`, 'i')
+        const m = html.match(regex)
+        return m ? parseFloat(m[1]) : null
+      }
+
+      const updates = {
+        pts:     getVal('PTS'),
+        reb:     getVal('REB'),
+        ast:     getVal('AST'),
+        stl:     getVal('STL'),
+        blk:     getVal('BLK'),
+        fg_pct:  getVal('FG%') || getVal('eFG'),
+        fg3_pct: getVal('3P%'),
+        ft_pct:  getVal('FT%'),
+        usg_pct: getVal('Usg'),
+        bpm:     getVal('BPM') || getVal('OBPM'),
+        porpag:  getVal('PORPAG'),
+        adjoe:   getVal('AdjOE'),
+        season:  `${year-1}-${String(year).slice(2)}`,
+        last_synced_at: new Date().toISOString(),
+      }
+
+      const filtered = Object.fromEntries(Object.entries(updates).filter(([,v]) => v !== null))
+      if (Object.keys(filtered).length < 3) throw new Error('Stats insuffisantes trouvées sur Barttorvik')
+
+      await db.from('players').update(filtered).eq('id', id)
+      await logSync('barttorvik', id, 'success', 1)
+      return res.json({ ok: true, stats: filtered, source: 'html' })
+    }
+
+    // Parser la réponse JSON Barttorvik
+    const p = Array.isArray(data[0]) ? data[0] : data
+    const updates = {
+      pts:     parseFloat(p[4])  || null,
+      reb:     parseFloat(p[7])  || null,
+      ast:     parseFloat(p[8])  || null,
+      stl:     parseFloat(p[10]) || null,
+      blk:     parseFloat(p[11]) || null,
+      fg_pct:  parseFloat(p[14]) || null,
+      fg3_pct: parseFloat(p[15]) || null,
+      ft_pct:  parseFloat(p[16]) || null,
+      usg_pct: parseFloat(p[17]) || null,
+      bpm:     parseFloat(p[19]) || null,
+      porpag:  parseFloat(p[22]) || null,
+      adjoe:   parseFloat(p[20]) || null,
+      season:  `${year-1}-${String(year).slice(2)}`,
+      last_synced_at: new Date().toISOString(),
+    }
+
+    const filtered = Object.fromEntries(Object.entries(updates).filter(([,v]) => v !== null))
+    await db.from('players').update(filtered).eq('id', id)
+    await logSync('barttorvik', id, 'success', 1)
+    res.json({ ok: true, stats: filtered, source: 'api' })
+
+  } catch (e) {
+    console.error('[Barttorvik]', e.message)
+    await logSync('barttorvik', id, 'error', 0, e.message)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ============================================================
+//  KENPOM — Contexte équipe NCAA
+// ============================================================
+app.post('/players/:id/sync-kenpom', requireAuth, async (req, res) => {
+  const { id } = req.params
+  const { team, kenpom_user, kenpom_pass } = req.body
+  if (!team) return res.status(400).json({ error: 'Nom d\'équipe requis' })
+
+  try {
+    // Login KenPom
+    const loginResp = await fetch('https://kenpom.com/handlers/login_handler.php', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://kenpom.com/index.php',
+      },
+      body: new URLSearchParams({
+        email:    kenpom_user || process.env.KENPOM_EMAIL,
+        password: kenpom_pass || process.env.KENPOM_PASSWORD,
+        submit:   'Login',
+      }),
+      redirect: 'manual',
+    })
+
+    const cookies = loginResp.headers.get('set-cookie') || ''
+    if (!cookies.includes('PHPSESSID')) throw new Error('Login KenPom échoué — vérifie tes identifiants')
+
+    // Récupérer la page équipe
+    const teamUrl = `https://kenpom.com/team.php?team=${encodeURIComponent(team)}`
+    const teamResp = await fetch(teamUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Cookie': cookies,
+      }
+    })
+
+    if (!teamResp.ok) throw new Error(`KenPom team HTTP ${teamResp.status}`)
+    const html = await teamResp.text()
+
+    const getVal = (label) => {
+      const regex = new RegExp(`${label}[^\\d-]*([\\d.]+)`, 'i')
+      const m = html.match(regex)
+      return m ? parseFloat(m[1]) : null
+    }
+
+    const teamStats = {
+      kenpom_adjoe:  getVal('AdjO') || getVal('Adj\\. O'),
+      kenpom_adjde:  getVal('AdjD') || getVal('Adj\\. D'),
+      kenpom_tempo:  getVal('AdjT') || getVal('Adj\\. T'),
+      kenpom_luck:   getVal('Luck'),
+      kenpom_rank:   getVal('Rk') || getVal('Rank'),
+    }
+
+    const filtered = Object.fromEntries(Object.entries(teamStats).filter(([,v]) => v !== null))
+
+    if (Object.keys(filtered).length === 0) throw new Error('Aucune donnée KenPom trouvée')
+
+    // Sauvegarder les stats équipe dans la fiche joueur
+    await db.from('players').update(filtered).eq('id', id)
+    res.json({ ok: true, teamStats: filtered })
+
+  } catch (e) {
+    console.error('[KenPom]', e.message)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// ============================================================
+//  RECHERCHE BARTTORVIK par nom (sans URL)
+// ============================================================
+app.get('/barttorvik/search', requireAuth, async (req, res) => {
+  const { name, team, year } = req.query
+  if (!name) return res.status(400).json({ error: 'Nom requis' })
+
+  try {
+    const y = year || new Date().getFullYear()
+    const url = `https://barttorvik.com/getplayer.php?year=${y}&player=${encodeURIComponent(name)}${team ? `&team=${encodeURIComponent(team)}` : ''}`
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    res.json({ ok: true, data })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+
+// ============================================================
+//  PLAYER SEASONS — Stats multi-ligues
+// ============================================================
+
+// GET toutes les saisons d'un joueur
+app.get('/players/:id/seasons', requireAuth, async (req, res) => {
+  const { data, error } = await db
+    .from('player_seasons')
+    .select('*')
+    .eq('player_id', req.params.id)
+    .order('season', { ascending: false })
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+// POST — ajouter une ligne de stats
+app.post('/players/:id/seasons', requireAuth, async (req, res) => {
+  const payload = { ...req.body, player_id: req.params.id, updated_at: new Date().toISOString() }
+  const { data, error } = await db.from('player_seasons').upsert(payload, {
+    onConflict: 'player_id,season,league'
+  }).select().single()
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+// PATCH — modifier une stat inline
+app.patch('/seasons/:seasonId', requireAuth, async (req, res) => {
+  const { data, error } = await db
+    .from('player_seasons')
+    .update({ ...req.body, updated_at: new Date().toISOString() })
+    .eq('id', req.params.seasonId)
+    .select().single()
+  if (error) return res.status(500).json({ error: error.message })
+  res.json(data)
+})
+
+// DELETE — supprimer une ligne de stats
+app.delete('/seasons/:seasonId', requireAuth, async (req, res) => {
+  const { error } = await db.from('player_seasons').delete().eq('id', req.params.seasonId)
+  if (error) return res.status(500).json({ error: error.message })
+  res.json({ ok: true })
+})
