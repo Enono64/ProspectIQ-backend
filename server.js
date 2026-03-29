@@ -1,5 +1,5 @@
 // ============================================================
-//  ScoutDex — Backend v1.0
+//  ProspectIQ — Backend v1.0
 //  Node.js / Express — Railway
 // ============================================================
 //  .env requis :
@@ -17,13 +17,23 @@ import cron             from 'node-cron';
 import fetch            from 'node-fetch';
 import { createClient } from '@supabase/supabase-js';
 
+
+// Saison en cours dynamique
+function currentSeason() {
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = now.getMonth() + 1
+  if (month >= 9) return `${year}-${String(year + 1).slice(2)}`
+  return `${year - 1}-${String(year).slice(2)}`
+}
+
 const app = express();
 app.use(cors({
-  origin: "*",
-  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","Authorization"],
+  origin: '*',
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.options("*", cors());
+app.options('*', cors());
 app.use(express.json());
 
 // ── Clients Supabase ──────────────────────────────────────────
@@ -64,7 +74,8 @@ async function logSync(type, playerId, status, rows = 0, errorMsg = null) {
   }
 }
 
-async function callClaude(messages, { maxTokens = 1500, webSearch = false } = {}) {
+// Appel Claude — un seul appel, Sonnet pour autofill, Haiku pour le reste
+async function callClaude(messages, { maxTokens = 1000, webSearch = false, model = 'claude-haiku-4-5-20251001' } = {}) {
   const headers = {
     'Content-Type':      'application/json',
     'x-api-key':         process.env.ANTHROPIC_API_KEY,
@@ -72,7 +83,7 @@ async function callClaude(messages, { maxTokens = 1500, webSearch = false } = {}
   };
   if (webSearch) headers['anthropic-beta'] = 'web-search-2025-03-05';
 
-  const body = { model: 'claude-haiku-4-5-20251001', max_tokens: maxTokens, messages };
+  const body = { model, max_tokens: maxTokens, messages };
   if (webSearch) body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
@@ -89,7 +100,6 @@ function parseAIJson(text) {
   return JSON.parse(match[0]);
 }
 
-// Calcul automatique des stats avancées depuis les stats de base
 function calculateAdvancedStats(p) {
   const s = {};
   if (p.pts && p.fga && p.fta)
@@ -158,32 +168,80 @@ app.delete('/players/:id', requireAuth, async (req, res) => {
 });
 
 // ============================================================
-//  AGENT IA — AUTO-REMPLISSAGE
+//  AGENT IA — AUTO-REMPLISSAGE (1 seul appel Sonnet)
 // ============================================================
 app.post('/players/autofill', requireAuth, async (req, res) => {
   const { name, league } = req.body;
   if (!name) return res.status(400).json({ error: 'Nom du joueur requis' });
 
   try {
-    const searchText = await callClaude([{
+    // Un seul appel Sonnet avec web search — recherche ET formatage en même temps
+    const result = await callClaude([{
       role: 'user',
-      content: `Search basketball player "${name}" ${league || ''} 2024-25 season.
-Find: points, rebounds, assists, steals, blocks, turnovers, FG%, 3P%, FT%, minutes, games played.
-Also: age, height (cm), weight (kg), nationality, team, league, position.
-Advanced stats if available: BPM, VORP, PER, USG%, TS%, eFG%, ORTG, DRTG.
-Search basketball-reference, eurobasket, proballers, ESPN.`
-    }], { webSearch: true, maxTokens: 2000 });
+      content: `You are a professional basketball data analyst. Find accurate stats for player "${name}" currently playing in ${league || 'professional basketball'}.
 
-    const formatted = await callClaude([{
-      role: 'user',
-      content: `Data about basketball player "${name}":
-${searchText.substring(0, 4000)}
+SEARCH INSTRUCTIONS:
+- Search for their CURRENT ${currentSeason()} season stats
+- Priority sources: basketball-reference.com, eurobasket.com, proballers.com, espn.com, realgm.com, fibaeurope.com, lnb.fr
+- If ${currentSeason()} not available, use most recent season
+- Search their current team and league first, then cross-reference
 
-Return ONLY valid JSON. No markdown. Percentages as 0-100. null for unknown.
-{"first_name":"","last_name":"","nationality":"","age":null,"height_cm":null,"weight_kg":null,"position":"","team":"","league":"","season":"2024-25","gp":null,"min":null,"pts":null,"reb":null,"ast":null,"stl":null,"blk":null,"tov":null,"fga":null,"fgm":null,"fg_pct":null,"fg3a":null,"fg3m":null,"fg3_pct":null,"fta":null,"ftm":null,"ft_pct":null,"per":null,"bpm":null,"obpm":null,"dbpm":null,"usg_pct":null,"vorp":null,"ortg":null,"drtg":null,"observation":""}`
-    }], { maxTokens: 1000 });
+DATA RULES — CRITICAL:
+- ALL stats must be PER GAME AVERAGES, never season totals
+- Percentages as numbers 0-100 (e.g. FG% = 48.3, NOT 0.483)
+- Sanity checks: PTS 0-60, REB 0-25, AST 0-20, STL 0-5, BLK 0-5, FG% 20-75, 3P% 0-55, FT% 40-100
+- If a value seems unrealistic for the position, set to null
+- Height in centimeters (e.g. 193 for 6'4"), weight in kg
+- position format: PG, SG, SF, PF, C, or combinations like PG/SG
+- photo_url: direct URL to official headshot if available (ESPN, team website)
 
-    const player = parseAIJson(formatted);
+Return ONLY a valid JSON object, no markdown, no explanation:
+{
+  "first_name": "",
+  "last_name": "",
+  "nationality": "",
+  "age": null,
+  "height_cm": null,
+  "weight_kg": null,
+  "position": "",
+  "team": "",
+  "league": "",
+  "season": "",
+  "photo_url": "",
+  "gp": null,
+  "min": null,
+  "pts": null,
+  "reb": null,
+  "ast": null,
+  "stl": null,
+  "blk": null,
+  "tov": null,
+  "fga": null,
+  "fgm": null,
+  "fg_pct": null,
+  "fg3a": null,
+  "fg3m": null,
+  "fg3_pct": null,
+  "fta": null,
+  "ftm": null,
+  "ft_pct": null,
+  "per": null,
+  "bpm": null,
+  "obpm": null,
+  "dbpm": null,
+  "usg_pct": null,
+  "vorp": null,
+  "ortg": null,
+  "drtg": null,
+  "observation": "1 sentence scouting note based on the stats"
+}`
+    }], {
+      webSearch: true,
+      maxTokens: 1500,
+      model: 'claude-sonnet-4-20250514'
+    });
+
+    const player = parseAIJson(result);
     Object.assign(player, calculateAdvancedStats(player));
     res.json({ ok: true, player });
 
@@ -194,14 +252,14 @@ Return ONLY valid JSON. No markdown. Percentages as 0-100. null for unknown.
 });
 
 // ============================================================
-//  SYNC STATS — Agent IA + BallDontLie NBA en renfort
+//  SYNC STATS — Agent IA + BallDontLie NBA
 // ============================================================
 async function syncPlayerStats(player) {
   const name = `${player.first_name} ${player.last_name}`;
   console.log(`[Sync] ${name} (${player.league})...`);
 
   try {
-    // Renfort NBA via BallDontLie
+    // NBA via BallDontLie
     if (player.league === 'NBA' && process.env.BALLDONTLIE_KEY) {
       const r = await fetch(
         `https://api.balldontlie.io/v1/players?search=${encodeURIComponent(name)}&per_page=3`,
@@ -211,7 +269,7 @@ async function syncPlayerStats(player) {
         const found = (await r.json()).data?.[0];
         if (found) {
           const sr = await fetch(
-            `https://api.balldontlie.io/v1/season_averages?player_ids[]=${found.id}&season=2024`,
+            `https://api.balldontlie.io/v1/season_averages?player_ids[]=${found.id}&season=2025`,
             { headers: { 'Authorization': process.env.BALLDONTLIE_KEY } }
           );
           if (sr.ok) {
@@ -223,7 +281,7 @@ async function syncPlayerStats(player) {
                 fg_pct:  s.fg_pct  ? +(s.fg_pct  * 100).toFixed(1) : null,
                 fg3_pct: s.fg3_pct ? +(s.fg3_pct * 100).toFixed(1) : null,
                 ft_pct:  s.ft_pct  ? +(s.ft_pct  * 100).toFixed(1) : null,
-                season: '2024-25', last_synced_at: new Date().toISOString(),
+                season: currentSeason(), last_synced_at: new Date().toISOString(),
               };
               Object.assign(updates, calculateAdvancedStats({ ...player, ...updates }));
               await db.from('players').update(updates).eq('id', player.id);
@@ -236,23 +294,19 @@ async function syncPlayerStats(player) {
       }
     }
 
-    // Agent IA pour toutes les autres ligues
-    const searchText = await callClaude([{
+    // Agent IA pour toutes les autres ligues (1 seul appel)
+    const result = await callClaude([{
       role: 'user',
-      content: `Find 2024-25 season stats for basketball player "${name}" in ${player.league || 'pro basketball'}.
-Search basketball-reference, eurobasket, proballers, ESPN.
-Stats needed: pts, reb, ast, stl, blk, tov, FG%, 3P%, FT%, min, gp.
-Advanced if available: BPM, VORP, PER, USG%, TS%, ORTG, DRTG.`
-    }], { webSearch: true, maxTokens: 1500 });
+      content: `Basketball data analyst task: find ${currentSeason()} per game stats for "${name}" playing in ${player.league || 'professional basketball'}.
 
-    const formatted = await callClaude([{
-      role: 'user',
-      content: `Stats for "${name}": ${searchText.substring(0, 3000)}
-Return ONLY JSON, no markdown, percentages 0-100, null for unknown.
+Search basketball-reference, eurobasket, proballers, ESPN, realgm, league official sites.
+Return ONLY valid JSON. Percentages 0-100. PER GAME averages only (not totals). null if not found.
+Sanity check before returning: PTS<60, REB<25, AST<20, STL<5, BLK<5, FG%<80.
+
 {"gp":null,"min":null,"pts":null,"reb":null,"ast":null,"stl":null,"blk":null,"tov":null,"fga":null,"fgm":null,"fg_pct":null,"fg3a":null,"fg3m":null,"fg3_pct":null,"fta":null,"ftm":null,"ft_pct":null,"per":null,"bpm":null,"obpm":null,"dbpm":null,"usg_pct":null,"vorp":null,"ortg":null,"drtg":null,"team":""}`
-    }], { maxTokens: 600 });
+    }], { webSearch: true, maxTokens: 1000 });
 
-    const stats = parseAIJson(formatted);
+    const stats = parseAIJson(result);
     const updates = Object.fromEntries(Object.entries(stats).filter(([, v]) => v !== null && v !== ''));
 
     if (Object.keys(updates).length < 3) throw new Error('Pas assez de stats trouvées');
@@ -271,7 +325,6 @@ Return ONLY JSON, no markdown, percentages 0-100, null for unknown.
   }
 }
 
-// Sync manuel d'un joueur
 app.post('/players/:id/sync', requireAuth, async (req, res) => {
   const { data: player, error } = await db
     .from('players').select('*').eq('id', req.params.id).single();
@@ -280,7 +333,6 @@ app.post('/players/:id/sync', requireAuth, async (req, res) => {
   res.json({ ok: true, message: 'Synchronisation lancée' });
 });
 
-// Sync tous les joueurs
 async function syncAllPlayers() {
   console.log('[CRON] Démarrage sync nocturne...');
   const { data: players } = await db
@@ -293,7 +345,7 @@ async function syncAllPlayers() {
 
   for (const player of players) {
     await syncPlayerStats(player);
-    await new Promise(r => setTimeout(r, 3000)); // 3s entre chaque joueur
+    await new Promise(r => setTimeout(r, 5000));
   }
   console.log('[CRON] ✅ Terminé');
 }
@@ -333,41 +385,129 @@ app.post('/players/:id/reports/ai', requireAuth, async (req, res) => {
     player.ortg   && `ORTG:${player.ortg} DRTG:${player.drtg} Net:${player.net_rtg}`,
   ].filter(Boolean).join('\n');
 
-  const prompt = `Tu es analyste data et scout basketball professionnel.
-Style : précis, factuel, chaque point justifié par des chiffres. Niveau NBA Analytics.
+    // Contexte de ligue pour la contextualisation
+  const leagueContext = {
+    'NBA':           { level: 10, desc: 'meilleure ligue mondiale' },
+    'EuroLeague':    { level: 9,  desc: 'meilleur niveau européen' },
+    'G-League':      { level: 7,  desc: 'antichambre NBA' },
+    'Betclic Élite': { level: 7,  desc: 'premier niveau français, équivalent D2 européen' },
+    'EuroCup':       { level: 8,  desc: 'deuxième niveau européen' },
+    'BCL':           { level: 7,  desc: 'troisième niveau européen' },
+    'Liga ACB (ESP)':{ level: 8,  desc: 'premier niveau espagnol, top-3 européen' },
+    'Pro B':         { level: 5,  desc: 'deuxième niveau français' },
+    'NM1':           { level: 4,  desc: 'troisième niveau français' },
+    'NCAA':          { level: 6,  desc: 'premier niveau universitaire américain' },
+    'Lega A (ITA)':  { level: 7,  desc: 'premier niveau italien' },
+    'BBL (GER)':     { level: 7,  desc: 'premier niveau allemand' },
+    'Korisliiga (FIN)': { level: 5, desc: 'premier niveau finlandais' },
+  }
+  const lgCtx = leagueContext[player.league] || { level: 5, desc: 'ligue professionnelle' }
 
-JOUEUR : ${name} | ${player.position} | ${player.team} | ${player.league}
-ÂGE : ${player.age} ans | TAILLE : ${player.height_cm} cm | NATION : ${player.nationality}
-NOTE SCOUT : ${player.scout_grade}/10 | STATUT : ${player.status}
-PLAFOND : ${player.ceiling || 'Non défini'}
+  // Détection automatique du profil
+  const pts = player.pts || 0
+  const ast = player.ast || 0
+  const reb = player.reb || 0
+  const usg = player.usg_pct || 0
+  const ts  = player.ts_pct  || 0
+  const bpm = player.bpm     || 0
+  const stl = player.stl     || 0
+  const blk = player.blk     || 0
 
-STATS 2024-25 :
+  let detectedProfile = ''
+  if (usg > 25 && pts > 18)                         detectedProfile = 'Primary scorer / 1st option'
+  else if (ast > 6 && usg > 20)                     detectedProfile = 'Playmaker / Primary ball-handler'
+  else if (usg > 22 && ast > 4 && pts > 14)         detectedProfile = 'Combo guard / Shot creator'
+  else if (ts > 58 && usg < 18 && pts > 10)         detectedProfile = '3&D / Efficient role player'
+  else if (reb > 8 && blk > 1.5)                    detectedProfile = 'Rim protector / Defensive anchor'
+  else if (reb > 9 && pts > 12)                     detectedProfile = 'Two-way big / Paint presence'
+  else if (ast > 5 && usg < 20)                     detectedProfile = 'Point guard / Facilitator'
+  else if (stl > 1.5 && bpm > 1)                    detectedProfile = 'Two-way wing / Defensive specialist'
+  else if (pts > 15 && ts > 55)                     detectedProfile = 'Efficient scorer / Secondary option'
+  else                                               detectedProfile = 'Role player / Specialist'
+
+  // InStat context si disponible
+  const instatLines = [
+    player.is_pnr_handler_made != null && `PnR Handler: ${player.is_pnr_handler_made}/match`,
+    player.is_iso_made         != null && `Isolation: ${player.is_iso_made}/match`,
+    player.is_cuts_made        != null && `Cuts: ${player.is_cuts_made}/match`,
+    player.is_drives_made      != null && `Drives: ${player.is_drives_made}/match`,
+    player.is_catch_shoot_made != null && `Catch&Shoot: ${player.is_catch_shoot_made}/match`,
+    player.is_post_made        != null && `Post Up: ${player.is_post_made}/match`,
+    player.is_deflections      != null && `Déflexions: ${player.is_deflections}/match`,
+    player.is_contested_made   != null && `Tirs contestés mis: ${player.is_contested_made}/match`,
+  ].filter(Boolean).join(' | ')
+
+  const prompt = `You are a senior basketball data analyst and scout at NBA front office level.
+Your reports are used by sporting directors and head coaches to make recruitment decisions.
+Write in French. Be precise, factual, data-driven. Every statement must cite a statistic.
+Never use vague phrases like "très athlétique" or "bon potentiel" without data to back it up.
+
+═══════════════════════════════════════
+FICHE JOUEUR
+═══════════════════════════════════════
+Nom : ${name}
+Poste : ${player.position} | Profil détecté : ${detectedProfile}
+Équipe : ${player.team} | Ligue : ${player.league} (niveau ${lgCtx.level}/10 — ${lgCtx.desc})
+Âge : ${player.age} ans | Taille : ${player.height_cm} cm | Nation : ${player.nationality}
+Note scout : ${player.scout_grade}/10 | Statut : ${player.status}
+Plafond estimé : ${player.ceiling || 'Non défini'}
+Comparable : ${player.comparable || 'Non défini'}
+Saison : ${player.season || '2025-26'}
+
+═══════════════════════════════════════
+STATISTIQUES
+═══════════════════════════════════════
 ${statsLines || 'Non disponibles'}
-${player.strengths   ? `\nFORCES : ${player.strengths}`        : ''}
-${player.weaknesses  ? `\nFAIBLESSES : ${player.weaknesses}`   : ''}
-${player.observation ? `\nTERRAIN : ${player.observation}`     : ''}
-${player.comparable  ? `\nCOMPARABLE : ${player.comparable}`   : ''}
+${instatLines ? `
+INSTAT : ${instatLines}` : ''}
+${player.strengths   ? `
+FORCES OBSERVÉES : ${player.strengths}`      : ''}
+${player.weaknesses  ? `
+FAIBLESSES OBSERVÉES : ${player.weaknesses}` : ''}
+${player.observation ? `
+NOTES TERRAIN : ${player.observation}`        : ''}
 
-Rédige un rapport scout analytique complet en français :
+═══════════════════════════════════════
+INSTRUCTIONS DU RAPPORT
+═══════════════════════════════════════
+Rédige un rapport scout professionnel complet en français avec ces 6 sections :
 
-## PROFIL
-2-3 phrases. Type de joueur, impact, style. 1-2 stats clés.
+## PROFIL & IDENTITÉ DE JEU
+Définis son archétype précis (ex: "floor general à fort volume de création", "3&D wing efficace en catch-and-shoot", "rim runner dans le PnR"). 
+Cite son profil détecté : ${detectedProfile}.
+2-3 phrases maximum, chaque mot compte.
 
 ## ANALYSE OFFENSIVE
-Forces offensives avec stats. Contextualise le USG%, TS%. Créateur/finisseur/espaceur ?
+- Contextualise son scoring : ${pts} pts dans ${player.league} (niveau ${lgCtx.level}/10) équivaut à quel impact réel ?
+- TS% ${ts}% : au-dessus/en-dessous de la moyenne du poste ? Efficient ou volume scorer ?
+- USG% ${usg}% : quelle place dans le système ?
+- Si InStat dispo : analyse son mode de création principal (PnR, ISO, Cuts, C&S...)
+- Forces et lacunes offensives précises avec chiffres.
 
-## ANALYSE DÉFENSIVE
-Stats défensives, engagement, lacunes réelles.
+## ANALYSE DÉFENSIVE  
+- Lire STL (${stl}), BLK (${blk}), DBPM si dispo.
+- Engagement défensif réel ou passif ?
+- Points faibles défensifs à exploiter.
+- Si InStat : déflexions, tirs contestés.
+
+## CONTEXTUALISATION & TRANSLATION
+- CRITIQUE : Comment ses stats se traduisent-elles au niveau supérieur ?
+- Facteur de traduction ligue : un joueur de ${player.league} (niveau ${lgCtx.level}/10) qui monte en EuroLeague voit ses stats baisser de combien ? Sois précis.
+- Quels aspects de son jeu sont "translation-proof" (valables à tous niveaux) ?
 
 ## PROJECTION & PLAFOND
-Niveau atteignable ? Délai ? Rôle précis ? Base sur l'âge + courbe stats.
+- Quel niveau peut-il atteindre dans 2 ans ? 5 ans ?
+- Quel rôle précis : starter / quality rotation / specialist / depth ?
+- Comparable data-driven : nomme un joueur pro dont les ratios à cet âge ressemblent aux siens. Justifie avec 2-3 stats similaires.
+- Si âge < 23 : marge de progression probable sur quel aspect ?
 
-## VERDICT
-⭐ TOP PROSPECT / 🟢 PRIORITAIRE / 🟡 À SURVEILLER / 🔵 EN VEILLE / 🔴 ÉCARTÉ
-+ 2 phrases de justification.`;
+## VERDICT FINAL
+Ligne 1 : ⭐ TOP PROSPECT / 🟢 PRIORITAIRE / 🟡 À SURVEILLER / 🔵 EN VEILLE / 🔴 ÉCARTÉ
+Ligne 2 : Recommandation d'action concrète (recruter maintenant / observer 3 matchs de plus / écarter / mettre en veille jusqu'à...).
+Ligne 3 : Prix de marché estimé (faible/moyen/élevé pour le niveau ${player.league}).\`;
 
   try {
-    const reportText = await callClaude([{ role: 'user', content: prompt }], { maxTokens: 1200 });
+    const reportText = await callClaude([{ role: 'user', content: prompt }], { maxTokens: 1000 });
     const { data: saved, error: saveError } = await db.from('reports').insert({
       player_id:    req.params.id,
       created_by:   req.user.id,
@@ -518,6 +658,6 @@ app.get('/admin/sync-logs', requireAuth, async (req, res) => {
 // ============================================================
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`🏀 ScoutDex API v1.0 — port ${PORT}`);
+  console.log(`🏀 ProspectIQ API v1.0 — port ${PORT}`);
   console.log(`   Sync nocturne : 6h00 Europe/Paris`);
 });
