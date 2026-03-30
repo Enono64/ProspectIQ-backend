@@ -147,7 +147,7 @@ app.get('/players/:id', requireAuth, async (req, res) => {
 });
 
 app.post('/players', requireAuth, async (req, res) => {
-  const payload = { ...req.body, created_by: req.user.id, ...calculateAdvancedStats(req.body) };
+  const payload = { ...req.body, ...calculateAdvancedStats(req.body) };
   const { data, error } = await db.from('players').insert(payload).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(data);
@@ -363,7 +363,7 @@ cron.schedule('0 6 * * *', syncAllPlayers, { timezone: 'Europe/Paris' });
 
 app.post('/players/:id/reports', requireAuth, async (req, res) => {
   const { data, error } = await db.from('reports')
-    .insert({ ...req.body, player_id: req.params.id, created_by: req.user.id, source: 'Manuel' })
+    .insert({ ...req.body, player_id: req.params.id, source: 'Manuel' })
     .select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.status(201).json(data);
