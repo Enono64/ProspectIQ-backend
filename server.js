@@ -345,7 +345,7 @@ async function syncAllPlayers() {
 
   for (const player of players) {
     await syncPlayerStats(player);
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 8000)); // Éviter rate limit Claude API
   }
   console.log('[CRON] ✅ Terminé');
 }
@@ -510,7 +510,6 @@ Ligne 3 : Prix de marché estimé (faible/moyen/élevé pour le niveau ${player.
     const reportText = await callClaude([{ role: 'user', content: prompt }], { maxTokens: 1000 });
     const { data: saved, error: saveError } = await db.from('reports').insert({
       player_id:    req.params.id,
-      created_by:   req.user.id,
       source:       'IA',
       report_date:  new Date().toISOString().split('T')[0],
       global_grade: player.scout_grade || 5,
