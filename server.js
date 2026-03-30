@@ -576,8 +576,8 @@ app.post('/players/compare', requireAuth, async (req, res) => {
   if (error || !players?.length) return res.status(404).json({ error: 'Joueurs introuvables' });
 
   const summary = players.map(p =>
-    `${p.first_name} ${p.last_name} (${p.position}, ${p.team}, ${p.league}) — ` +
-    `${p.pts}pts ${p.reb}reb ${p.ast}ast | TS%:${p.ts_pct} BPM:${p.bpm} USG%:${p.usg_pct} | Note:${p.scout_grade}/10`
+    p.first_name + ' ' + p.last_name + ' (' + p.position + ', ' + p.team + ', ' + p.league + ') — ' +
+    p.pts + 'pts ' + p.reb + 'reb ' + p.ast + 'ast | TS%:' + p.ts_pct + ' BPM:' + p.bpm + ' USG%:' + p.usg_pct + ' | Note:' + p.scout_grade + '/10'
   ).join('\n');
 
   try {
